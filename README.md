@@ -57,6 +57,8 @@ Speed depends on your GPU. The biggest book I have (62 hours) took 20 minutes on
 
 If you only read on Android and you have your abs server open to the wide web, I recommend you don't use the web client. ABS updates might break it and you'll also be missing security updates.
 
+Source code for the clients are in branches. [client-web](../../tree/client-web) [client-mobile](../../tree/client-mobile)
+
 ## Implementation details
 
 ### The `.smil` file
