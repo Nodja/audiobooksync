@@ -7,6 +7,10 @@
       <button v-if="hasSettings" @click="openSettings" type="button" aria-label="Ereader settings" class="mx-4 inline-flex opacity-80 hover:opacity-100">
         <span class="material-symbols text-1.5xl">settings</span>
       </button>
+      <!-- No ui-tooltip: it wraps the button in a div, which breaks the row's flex alignment. -->
+      <button v-if="hasAudio" @click="togglePlayer" type="button" :aria-label="$strings.LabelShowPlayer" :title="$strings.LabelShowPlayer" :aria-pressed="isPlayerShowing" class="inline-flex opacity-80 hover:opacity-100">
+        <span class="material-symbols text-1.5xl">{{ isPlayerShowing ? 'stop_circle' : 'play_circle' }}</span>
+      </button>
     </div>
 
     <div class="absolute top-4 left-1/2 transform -translate-x-1/2">
@@ -23,7 +27,7 @@
       </button>
     </div>
 
-    <component v-if="componentName" ref="readerComponent" :is="componentName" :library-item="selectedLibraryItem" :player-open="!!streamLibraryItem" :keep-progress="keepProgress" :file-id="ebookFileId" @touchstart="touchstart" @touchend="touchend" @hook:mounted="readerMounted" />
+    <component v-if="componentName" ref="readerComponent" :is="componentName" :library-item="selectedLibraryItem" :player-open="!!streamLibraryItem" :keep-progress="keepProgress" :file-id="ebookFileId" @touchstart="touchstart" @touchend="touchend" @sync-status="syncStatus = $event" @hook:mounted="readerMounted" />
 
     <!-- TOC side nav -->
     <div v-if="tocOpen" class="w-full h-full overflow-y-scroll absolute inset-0 bg-black/20 z-20" @click.stop.prevent="toggleToC"></div>
@@ -109,11 +113,32 @@
           </div>
           <ui-range-input v-model="ereaderSettings.textStroke" :min="0" :max="300" :step="5" @input="settingsUpdated" />
         </div>
-        <div class="flex items-center">
+        <div class="flex items-center mb-4">
           <div class="w-40">
             <p class="text-lg">{{ $strings.LabelLayout }}:</p>
           </div>
           <ui-toggle-btns v-model="ereaderSettings.spread" :items="spreadItems" @input="settingsUpdated" />
+        </div>
+        <div class="flex items-center mb-4">
+          <div class="w-40">
+            <p class="text-lg">{{ $strings.LabelFlow }}:</p>
+          </div>
+          <ui-toggle-btns v-model="ereaderSettings.flow" :items="flowItems" @input="settingsUpdated" />
+        </div>
+        <div class="flex items-center">
+          <div class="w-40">
+            <p class="text-lg">{{ $strings.LabelSyncWithAudio }}:</p>
+          </div>
+          <ui-toggle-switch v-model="ereaderSettings.sync" :label="$strings.LabelSyncWithAudio" @input="settingsUpdated" />
+        </div>
+        <div class="flex items-center mt-4">
+          <div class="w-40">
+            <p class="text-lg">{{ $strings.LabelClickToSeek }}:</p>
+          </div>
+          <ui-toggle-switch v-model="ereaderSettings.clickToSeek" :label="$strings.LabelClickToSeek" @input="settingsUpdated" />
+        </div>
+        <div v-if="syncStatus" class="mt-2 text-sm opacity-70">
+          {{ syncStatus }}
         </div>
       </div>
     </modals-modal>
@@ -143,8 +168,12 @@ export default {
         lineSpacing: 115,
         fontBoldness: 100,
         spread: 'auto',
-        textStroke: 0
-      }
+        flow: 'paginated',
+        textStroke: 0,
+        sync: true,
+        clickToSeek: true
+      },
+      syncStatus: ''
     }
   },
   watch: {
@@ -176,6 +205,18 @@ export default {
         {
           text: this.$strings.LabelLayoutSplitPage,
           value: 'auto'
+        }
+      ]
+    },
+    flowItems() {
+      return [
+        {
+          text: this.$strings.LabelFlowPaginated,
+          value: 'paginated'
+        },
+        {
+          text: this.$strings.LabelFlowScrolled,
+          value: 'scrolled'
         }
       ]
     },
@@ -219,6 +260,13 @@ export default {
     },
     hasSettings() {
       return this.isEpub
+    },
+    hasAudio() {
+      const media = this.selectedLibraryItem?.media
+      return (media?.numTracks || media?.audioFiles?.length || 0) > 0
+    },
+    isPlayerShowing() {
+      return !!this.streamLibraryItem && this.streamLibraryItem.id === this.selectedLibraryItem?.id
     },
     abTitle() {
       return this.mediaMetadata.title
@@ -325,6 +373,22 @@ export default {
         this.isSearching = false
         this.searchResults = []
       }
+    },
+    /** Closing the player ends the session, so showing it again opens the item the way the play button does. */
+    togglePlayer() {
+      if (this.isPlayerShowing) {
+        this.$eventBus.$emit('close-player')
+        return
+      }
+
+      const item = this.selectedLibraryItem
+      if (!item?.id) return
+      this.$eventBus.$emit('play-item', {
+        libraryItemId: item.id,
+        episodeId: null,
+        startTime: null,
+        queueItems: []
+      })
     },
     next() {
       if (this.$refs.readerComponent?.next) this.$refs.readerComponent.next()

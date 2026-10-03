@@ -1,32 +1,90 @@
 <template>
-  <div id="epub-reader" class="h-full w-full">
-    <div class="h-full flex items-center justify-center">
-      <button type="button" aria-label="Previous page" class="w-24 max-w-24 h-full hidden sm:flex items-center overflow-x-hidden justify-center opacity-50 hover:opacity-100">
-        <span v-if="hasPrev" class="material-symbols text-6xl" @mousedown.prevent @click="prev">chevron_left</span>
+  <div id="epub-reader" class="h-full w-full flex flex-col">
+    <!-- Top strip stays empty: Reader.vue floats the book title there and foliate paints over anything it overlaps. -->
+    <div class="relative grow min-h-0 pt-11">
+      <button v-if="view" type="button" aria-label="Previous page" class="absolute left-0 top-0 z-10 h-full w-16 hidden sm:flex items-center justify-center opacity-40 hover:opacity-100" @click="prev">
+        <span class="material-symbols text-5xl">chevron_left</span>
       </button>
-      <div id="frame" class="w-full" style="height: 80%">
-        <div id="viewer"></div>
+
+      <div ref="frame" id="frame" class="h-full w-full overflow-hidden"></div>
+
+      <button v-if="view" type="button" aria-label="Next page" class="absolute right-0 top-0 z-10 h-full w-16 hidden sm:flex items-center justify-center opacity-40 hover:opacity-100" @click="next">
+        <span class="material-symbols text-5xl">chevron_right</span>
+      </button>
+
+      <div v-if="loading" class="absolute inset-0 flex items-center justify-center bg-black/30">
+        <p class="text-sm opacity-80">{{ loadingMessage }}</p>
       </div>
-      <button type="button" aria-label="Next page" class="w-24 max-w-24 h-full hidden sm:flex items-center justify-center overflow-x-hidden opacity-50 hover:opacity-100">
-        <span v-if="hasNext" class="material-symbols text-6xl" @mousedown.prevent @click="next">chevron_right</span>
-      </button>
     </div>
   </div>
 </template>
 
 <script>
-import ePub from 'epubjs'
-
 /**
- * @typedef {object} EpubReader
- * @property {ePub.Book} book
- * @property {ePub.Rendition} rendition
+ * EPUB reader backed by foliate-js, with audiobook read-along.
+ *
+ * A sidecar addresses a sentence as `chapter.xhtml#abs-p-7`; `abs-anchors.js` repeats the
+ * generator's numbering to find it. The audio player owns playback and this component polls its
+ * clock, turning the page when the spoken sentence is off screen.
  */
+
+// Plain ES modules in `client/static`, served from the site root.
+const FOLIATE_VIEW = '/js/foliate/view.js'
+const FOLIATE_ANCHORS = '/js/foliate/abs-anchors.js'
+const FOLIATE_ZIP = '/js/foliate/vendor/zip-loader.js'
+const FOLIATE_EPUB = '/js/foliate/epub.js'
+
+// The vendored foliate files must not be bundled, and webpack 4 has no `webpackIgnore`. Building the
+// import through `new Function` hides it from webpack but stays a real browser `import()`.
+const runtimeImport = new Function('url', 'return import(url)')
+
+/** Minimum gap between automatic section changes (seeks are exempt). */
+const SECTION_TURN_GAP_MS = 1200
+/** A clock jump bigger than this between two polls is a seek, not playback. */
+const SEEK_JUMP_SECONDS = 5
+/** Playback clock sampling interval; a native `timeupdate` (~250 ms) is too coarse for word highlighting. */
+const SYNC_POLL_MS = 60
+
+const MAX_SEARCH_RESULTS_PER_SECTION = 40
+
+// Overlayer keeps one layer per key, so re-adding under the same key replaces the highlight.
+const SENTENCE_KEY = 'abs-sync-sentence'
+const WORD_KEY = 'abs-sync-word'
+const SENTENCE_COLOR = '#5b8def'
+const SENTENCE_OPACITY = 0.28
+const WORD_COLOR = '#f0a020'
+const WORD_RULE_WIDTH = 2
+
+const SVG_NS = 'http://www.w3.org/2000/svg'
+
+/** Section documents that already carry the click handler; foliate may announce one more than once. */
+const clickWired = new WeakSet()
+
+function svgRects(rects, fill, opacity, toRectAttrs) {
+  const g = document.createElementNS(SVG_NS, 'g')
+  g.setAttribute('fill', fill)
+  if (opacity != null) g.setAttribute('opacity', String(opacity))
+  for (const r of rects) {
+    const rect = document.createElementNS(SVG_NS, 'rect')
+    for (const [name, value] of Object.entries(toRectAttrs(r))) rect.setAttribute(name, String(value))
+    g.appendChild(rect)
+  }
+  return g
+}
+
+function drawHighlight(rects, { color = SENTENCE_COLOR, opacity = SENTENCE_OPACITY } = {}) {
+  return svgRects(rects, color, opacity, ({ left, top, width, height }) => ({ x: left, y: top, width, height }))
+}
+
+function drawUnderline(rects, { color = WORD_COLOR, width = WORD_RULE_WIDTH } = {}) {
+  return svgRects(rects, color, null, ({ left, bottom, width: span }) => ({ x: left, y: bottom - width, width: span, height: width }))
+}
+
 export default {
   props: {
     libraryItem: {
       type: Object,
-      default: () => {}
+      default: () => ({})
     },
     playerOpen: Boolean,
     keepProgress: Boolean,
@@ -34,41 +92,67 @@ export default {
   },
   data() {
     return {
+      loading: true,
+      loadingMessage: 'Loading ebook…',
       windowWidth: 0,
-      windowHeight: 0,
-      /** @type {ePub.Book} */
       book: null,
-      /** @type {ePub.Rendition} */
-      rendition: null,
+      view: null,
+      anchors: null,
       chapters: [],
+      currentLocationCfi: null,
+      onRelocateListener: null,
+      resizeTimer: null,
+
+      syncCues: null,
+      syncIndex: null,
+      blockCues: null,
+      syncEnabled: false,
+      syncTimer: null,
+      // A standing problem with this book's sidecar, empty when there is none.
+      syncStatus: '',
+      // Why following is idle right now; recomputed every poll.
+      syncBlocker: '',
+      syncCueIndex: -1,
+      syncWordIndex: -1,
+      // What is painted, as against requested above. They differ while a page turn is deferred,
+      // which is what makes the poll retry.
+      syncPaintedCue: -1,
+      syncPaintedWord: -1,
+      lastSyncTime: -1,
+      syncLastJump: 0,
+      // True while revealRange moves the renderer; its `load` event must not re-enter.
+      syncNavigating: false,
+      syncTurning: false,
+
       ereaderSettings: {
         theme: 'dark',
         font: 'serif',
         fontScale: 100,
         lineSpacing: 115,
         spread: 'auto',
-        textStroke: 0
+        flow: 'paginated',
+        textStroke: 0,
+        sync: true,
+        clickToSeek: true
       }
     }
   },
-  watch: {
-    playerOpen() {
-      this.resize()
-    }
-  },
   computed: {
-    /** @returns {string} */
     libraryItemId() {
       return this.libraryItem?.id
     },
-    allowScriptedContent() {
-      return this.$store.getters['libraries/getLibraryEpubsAllowScriptedContent']
+    libraryFiles() {
+      return this.libraryItem?.libraryFiles || []
     },
-    hasPrev() {
-      return !this.rendition?.location?.atStart
+    smilFile() {
+      return this.libraryFiles.find((lf) => /\.smil$/i.test(lf?.metadata?.filename || '')) || null
     },
-    hasNext() {
-      return !this.rendition?.location?.atEnd
+    hasSyncTrack() {
+      return !!this.syncCues?.length
+    },
+    syncStatusText() {
+      if (this.ereaderSettings.sync === false) return ''
+      return this.syncStatus || this.syncBlocker || (this.hasSyncTrack ? '' : 'no sync file for this book')
     },
     userMediaProgress() {
       if (!this.libraryItemId) return
@@ -76,401 +160,672 @@ export default {
     },
     savedEbookLocation() {
       if (!this.keepProgress) return null
-      if (!this.userMediaProgress?.ebookLocation) return null
-      // Validate ebookLocation is an epubcfi
-      if (!String(this.userMediaProgress.ebookLocation).startsWith('epubcfi')) return null
-      return this.userMediaProgress.ebookLocation
-    },
-    localStorageLocationsKey() {
-      return `ebookLocations-${this.libraryItemId}`
-    },
-    readerWidth() {
-      if (this.windowWidth < 640) return this.windowWidth
-      return this.windowWidth - 200
-    },
-    readerHeight() {
-      if (this.windowHeight < 400 || !this.playerOpen) return this.windowHeight
-      return this.windowHeight - 164
+      const location = this.userMediaProgress?.ebookLocation
+      return String(location || '').startsWith('epubcfi') ? location : null
     },
     ebookUrl() {
-      if (this.fileId) {
-        return `/api/items/${this.libraryItemId}/ebook/${this.fileId}`
-      }
-      return `/api/items/${this.libraryItemId}/ebook`
+      const base = `/api/items/${this.libraryItemId}/ebook`
+      return this.fileId ? `${base}/${this.fileId}` : base
     },
-    themeRules() {
-      const theme = this.ereaderSettings.theme
+    streamLibraryItem() {
+      return this.$store.state.streamLibraryItem
+    },
+    isPlayingThisItem() {
+      return !!this.streamLibraryItem && this.streamLibraryItem.id === this.libraryItemId
+    },
+    themeStyles() {
+      const { theme, font, fontScale, lineSpacing } = this.ereaderSettings
       const isDark = theme === 'dark'
       const isSepia = theme === 'sepia'
+      const fontColor = isDark ? '#fff' : isSepia ? '#5b4636' : '#000'
+      const backgroundColor = isDark ? 'rgb(35 35 35)' : isSepia ? 'rgb(244 236 216)' : 'rgb(255 255 255)'
+      const textStroke = this.ereaderSettings.textStroke / 100
+      const family = font === 'sans-serif' ? 'sans-serif' : 'serif'
 
-      const fontColor = isDark
-        ? '#fff'
-        : isSepia
-        ? '#5b4636'
-        : '#000'
-
-      const backgroundColor = isDark
-        ? 'rgb(35 35 35)'
-        : isSepia
-        ? 'rgb(244, 236, 216)'
-        : 'rgb(255, 255, 255)'
-
-      const lineSpacing = this.ereaderSettings.lineSpacing / 100
-      const fontScale   = this.ereaderSettings.fontScale   / 100
-      const textStroke  = this.ereaderSettings.textStroke  / 100
-
-      return {
-        '*': {
-          color: `${fontColor}!important`,
-          'background-color': `${backgroundColor}!important`,
-          'line-height': `${lineSpacing * fontScale}rem!important`,
-          '-webkit-text-stroke': `${textStroke}px ${fontColor}!important`
-        },
-        a: {
-          color: `${fontColor}!important`
+      // `fontScale` goes on the root only: a percentage font-size on every element compounds per
+      // nesting level.
+      return `
+        html {
+          color: ${fontColor} !important;
+          background: ${backgroundColor} !important;
+          font-size: ${fontScale}% !important;
         }
+        html, body, body * {
+          line-height: ${lineSpacing}% !important;
+        }
+        body {
+          color: ${fontColor} !important;
+          background: ${backgroundColor} !important;
+          font-family: ${family} !important;
+          -webkit-text-stroke: ${textStroke}px ${fontColor};
+          padding: 0 !important;
+          margin: 0 !important;
+          widows: 0; orphans: 0;
+        }
+        a { color: ${fontColor} !important; }
+        p, li, blockquote { color: ${fontColor} !important; }
+        img, svg { max-width: 100% !important; max-height: 100% !important; }
+        ::selection { background: rgba(120, 170, 255, .45); }
+      `
+    }
+  },
+  watch: {
+    playerOpen() {
+      this.resize()
+    },
+    // Reader.vue shows this in its settings; a ref read there would never update.
+    syncStatusText: {
+      immediate: true,
+      handler(text) {
+        this.$emit('sync-status', text)
       }
     }
   },
   methods: {
-    updateSettings(settings) {
-      this.ereaderSettings = settings
+    async initEpub() {
+      this.loading = true
+      this.loadingMessage = 'Loading ebook…'
+      this.windowWidth = window.innerWidth
 
-      if (!this.rendition) return
+      try {
+        // view.js registers the <foliate-view> custom element as a side effect of loading.
+        const [, anchors] = await Promise.all([runtimeImport(FOLIATE_VIEW), runtimeImport(FOLIATE_ANCHORS)])
+        this.anchors = anchors
 
-      this.applyTheme()
+        this.loadingMessage = 'Unpacking ebook…'
+        const buffer = await this.$axios.$get(this.ebookUrl, { responseType: 'arraybuffer' })
+        const { makeZipLoader } = await runtimeImport(FOLIATE_ZIP)
+        const loader = await makeZipLoader(new Uint8Array(buffer))
+        const { EPUB } = await runtimeImport(FOLIATE_EPUB)
+        this.book = await new EPUB(loader).init()
 
-      const fontScale = settings.fontScale || 100
-      this.rendition.themes.fontSize(`${fontScale}%`)
-      this.rendition.themes.font(settings.font)
-      this.rendition.spread(settings.spread || 'auto')
+        // Component was destroyed while the book was downloading.
+        if (!this.$refs.frame) return
+
+        this.loadingMessage = 'Rendering…'
+        const view = document.createElement('foliate-view')
+        Object.assign(view.style, { display: 'block', width: '100%', height: '100%' })
+        this.$refs.frame.appendChild(view)
+        this.view = view
+
+        // A field so destroy() can remove it.
+        this.onRelocateListener = (event) => this.onRelocate(event.detail)
+        view.addEventListener('relocate', this.onRelocateListener)
+        view.addEventListener('load', this.onSectionLoad)
+        view.addEventListener('create-overlay', this.onOverlayCreated)
+        // Reader.vue listens for these for swipe gestures.
+        view.addEventListener('touchstart', (e) => this.$emit('touchstart', e))
+        view.addEventListener('touchend', (e) => this.$emit('touchend', e))
+
+        await view.open(this.book)
+        this.applyStyles()
+
+        // Restore the saved position before following starts, so stale progress does not win.
+        const location = this.savedEbookLocation
+        if (location) {
+          await view.goTo(location).catch(() => view.init({ showTextStart: true }))
+        } else {
+          await view.init({ showTextStart: true })
+        }
+
+        this.buildChapters()
+        this.loading = false
+        this.loadSyncTrack()
+      } catch (error) {
+        console.error('[EpubReader] failed to open epub', error)
+        this.loadingMessage = `Could not open this ebook: ${error.message}`
+        this.loading = false
+      }
     },
+
+    destroy() {
+      this.detachSync()
+      if (this.view) {
+        this.view.removeEventListener('relocate', this.onRelocateListener)
+        this.view.removeEventListener('load', this.onSectionLoad)
+        this.view.removeEventListener('create-overlay', this.onOverlayCreated)
+        try {
+          this.view.close()
+        } catch (error) {
+          console.warn('[EpubReader] view.close failed', error)
+        }
+        this.view.remove()
+        this.view = null
+      }
+      this.book = null
+    },
+
+    onRelocate(location) {
+      if (!location?.cfi || location.cfi === this.currentLocationCfi) return
+      this.currentLocationCfi = location.cfi
+      // Don't write back the position that was just restored.
+      if (this.savedEbookLocation === location.cfi) return
+
+      const payload = { ebookLocation: location.cfi }
+      if (location.fraction != null) payload.ebookProgress = location.fraction
+      this.updateProgress(payload)
+    },
+
+    /** A page turn destroys the old Overlayer. Repaint only: turning here would undo the reader's own navigation. */
+    onSectionLoad(event) {
+      const doc = event?.detail?.doc
+      if (doc && !clickWired.has(doc)) {
+        clickWired.add(doc)
+        doc.addEventListener('click', (e) => this.onContentClick(e, doc))
+      }
+      this.applyStyles()
+      // A `load` fired by our own renderer.goTo is already on the right page.
+      if (this.syncNavigating) return
+      this.refreshSyncHighlight(false)
+    },
+
+    /** The Overlayer is created before layout, so its rects are empty until redrawn. */
+    onOverlayCreated() {
+      if (this.syncEnabled) this.refreshSyncHighlight(false)
+    },
+
+    applyStyles() {
+      const renderer = this.view?.renderer
+      if (!renderer?.setStyles) return
+      renderer.setStyles(this.themeStyles)
+      this.applyLayout()
+    },
+
+    /**
+     * Set as attributes, since foliate copies them into a closed shadow root that CSS custom
+     * properties on the host do not reach. Only written on change: each write re-renders the section.
+     */
+    applyLayout() {
+      this.setRendererAttribute('max-column-count', this.ereaderSettings.spread === 'none' ? '1' : '2')
+      this.setRendererAttribute('max-inline-size', `${this.textColumnWidth()}px`)
+      if (this.ereaderSettings.flow === 'scrolled') this.setRendererAttribute('flow', 'scrolled')
+      else this.view?.renderer?.removeAttribute('flow')
+    },
+
+    setRendererAttribute(name, value) {
+      const renderer = this.view?.renderer
+      if (renderer && renderer.getAttribute(name) !== value) renderer.setAttribute(name, value)
+    },
+
+    /** foliate fixes the text column at 720px; this lets it grow with the window. */
+    textColumnWidth() {
+      const available = this.view?.clientWidth || this.windowWidth || 0
+      if (!available) return 720
+      return Math.min(Math.max(Math.round(available * 0.62), 560), 1080)
+    },
+
+    /** Re-flow invalidates painted rects. Repaints in place and never moves the reader. */
+    restyle() {
+      this.applyStyles()
+      this.redrawHighlight()
+      this.refreshSyncHighlight(false)
+    },
+
     prev() {
-      if (!this.rendition?.manager) return
-      return this.rendition?.prev()
+      return this.view?.prev()
     },
     next() {
-      if (!this.rendition?.manager) return
-      return this.rendition?.next()
+      return this.view?.next()
     },
     goToChapter(href) {
-      if (!this.rendition?.manager) return
-      return this.rendition?.display(href)
+      return this.view?.goTo(href)
     },
-    /** @returns {object} Returns the chapter that the `position` in the book is in */
-    findChapterFromPosition(chapters, position) {
-      let foundChapter
-      for (let i = 0; i < chapters.length; i++) {
-        if (position >= chapters[i].start && (!chapters[i + 1] || position < chapters[i + 1].start)) {
-          foundChapter = chapters[i]
-          if (chapters[i].subitems && chapters[i].subitems.length > 0) {
-            return this.findChapterFromPosition(chapters[i].subitems, position, foundChapter)
-          }
-          break
+
+    /** `sync` rides in the same object as the theme settings; `undefined` counts as on. */
+    updateSettings(settings) {
+      this.ereaderSettings = { ...this.ereaderSettings, ...settings }
+      this.applySyncPreference()
+      this.restyle()
+    },
+
+    /** Keyed off the timer, not `syncEnabled`: settings arrive before the sidecar has loaded. */
+    applySyncPreference() {
+      const wanted = this.ereaderSettings.sync !== false && !!this.syncIndex
+      const running = this.syncTimer !== null
+
+      if (wanted && !running) {
+        this.syncEnabled = true
+        this.attachSync()
+        // Land on where the audio is now, ignoring the turn rate limit.
+        this.refreshSyncHighlight(true, true)
+      } else if (!wanted && (running || this.syncEnabled)) {
+        this.syncEnabled = false
+        this.detachSync()
+        this.clearHighlight()
+      }
+    },
+
+    buildChapters() {
+      const flat = []
+      const walk = (items) => {
+        for (const item of items || []) {
+          flat.push({ label: (item.label || '').trim(), href: item.href || '', subitems: item.subitems || [] })
+          walk(item.subitems)
         }
       }
-      return foundChapter
+      walk(this.book?.toc)
+
+      this.chapters = flat.map((item, index) => ({
+        id: index,
+        title: item.label || `Section ${index + 1}`,
+        href: item.href,
+        subitems: item.subitems.map((sub, subIndex) => ({
+          id: `${index}-${subIndex}`,
+          title: (sub.label || '').trim(),
+          href: sub.href,
+          subitems: [],
+          searchResults: []
+        })),
+        searchResults: []
+      }))
     },
-    /** @returns {Array} Returns an array of chapters that only includes chapters with query results */
+
+    /** `view.search` isn't vendored, so this walks the sections and attaches `searchResults` to chapters. */
     async searchBook(query) {
-      const chapters = structuredClone(await this.chapters)
-      const searchResults = await Promise.all(this.book.spine.spineItems.map((item) => item.load(this.book.load.bind(this.book)).then(item.find.bind(item, query)).finally(item.unload.bind(item))))
-      const mergedResults = [].concat(...searchResults)
+      const needle = String(query || '').trim().toLowerCase()
+      if (needle.length < 2 || !this.book) return []
 
-      mergedResults.forEach((chapter) => {
-        chapter.start = this.book.locations.percentageFromCfi(chapter.cfi)
-        const foundChapter = this.findChapterFromPosition(chapters, chapter.start)
-        if (foundChapter) foundChapter.searchResults.push(chapter)
-      })
-
-      let filteredResults = chapters.filter(function f(o) {
-        if (o.searchResults.length) return true
-        if (o.subitems.length) {
-          return (o.subitems = o.subitems.filter(f)).length
-        }
-      })
-      return filteredResults
-    },
-    keyUp(e) {
-      const rtl = this.book.package.metadata.direction === 'rtl'
-      if ((e.keyCode || e.which) == 37) {
-        return rtl ? this.next() : this.prev()
-      } else if ((e.keyCode || e.which) == 39) {
-        return rtl ? this.prev() : this.next()
+      const withResults = (item) => ({ ...item, searchResults: [] })
+      const chapters = this.chapters.map((c) => ({ ...withResults(c), subitems: c.subitems.map(withResults) }))
+      const byHref = new Map()
+      for (const chapter of chapters) {
+        byHref.set(this.normaliseHref(chapter.href), chapter)
+        for (const sub of chapter.subitems) byHref.set(this.normaliseHref(sub.href), sub)
       }
-    },
-    /**
-     * @param {object} payload
-     * @param {string} payload.ebookLocation - CFI of the current location
-     * @param {string} payload.ebookProgress - eBook Progress Percentage
-     */
-    updateProgress(payload) {
-      if (!this.keepProgress) return
-      this.$axios.$patch(`/api/me/progress/${this.libraryItemId}`, payload, { progress: false }).catch((error) => {
-        console.error('EpubReader.updateProgress failed:', error)
-      })
-    },
-    getAllEbookLocationData() {
-      const locations = []
-      let totalSize = 0 // Total in bytes
 
-      for (const key in localStorage) {
-        if (!localStorage.hasOwnProperty(key) || !key.startsWith('ebookLocations-')) {
+      for (const [index, section] of this.book.sections.entries()) {
+        let doc
+        try {
+          doc = await section.createDocument()
+        } catch (error) {
+          console.warn('[EpubReader] search could not load section', index, error)
           continue
         }
 
-        try {
-          const ebookLocations = JSON.parse(localStorage[key])
-          if (!ebookLocations.locations) throw new Error('Invalid locations object')
-
-          ebookLocations.key = key
-          ebookLocations.size = (localStorage[key].length + key.length) * 2
-          locations.push(ebookLocations)
-          totalSize += ebookLocations.size
-        } catch (error) {
-          console.error('Failed to parse ebook locations', key, error)
-          localStorage.removeItem(key)
-        }
-      }
-
-      // Sort by oldest lastAccessed first
-      locations.sort((a, b) => a.lastAccessed - b.lastAccessed)
-
-      return {
-        locations,
-        totalSize
-      }
-    },
-    /** @param {string} locationString */
-    checkSaveLocations(locationString) {
-      const maxSizeInBytes = 3000000 // Allow epub locations to take up to 3MB of space
-      const newLocationsSize = JSON.stringify({ lastAccessed: Date.now(), locations: locationString }).length * 2
-
-      // Too large overall
-      if (newLocationsSize > maxSizeInBytes) {
-        console.error('Epub locations are too large to store. Size =', newLocationsSize)
-        return
-      }
-
-      const ebookLocationsData = this.getAllEbookLocationData()
-
-      let availableSpace = maxSizeInBytes - ebookLocationsData.totalSize
-
-      // Remove epub locations until there is room for locations
-      while (availableSpace < newLocationsSize && ebookLocationsData.locations.length) {
-        const oldestLocation = ebookLocationsData.locations.shift()
-        console.log(`Removing cached locations for epub "${oldestLocation.key}" taking up ${oldestLocation.size} bytes`)
-        availableSpace += oldestLocation.size
-        localStorage.removeItem(oldestLocation.key)
-      }
-
-      console.log(`Cacheing epub locations with key "${this.localStorageLocationsKey}" taking up ${newLocationsSize} bytes`)
-      this.saveLocations(locationString)
-    },
-    /** @param {string} locationString */
-    saveLocations(locationString) {
-      localStorage.setItem(
-        this.localStorageLocationsKey,
-        JSON.stringify({
-          lastAccessed: Date.now(),
-          locations: locationString
-        })
-      )
-    },
-    loadLocations() {
-      const locationsObjString = localStorage.getItem(this.localStorageLocationsKey)
-      if (!locationsObjString) return null
-
-      const locationsObject = JSON.parse(locationsObjString)
-
-      // Remove invalid location objects
-      if (!locationsObject.locations) {
-        console.error('Invalid epub locations stored', this.localStorageLocationsKey)
-        localStorage.removeItem(this.localStorageLocationsKey)
-        return null
-      }
-
-      // Update lastAccessed
-      this.saveLocations(locationsObject.locations)
-
-      return locationsObject.locations
-    },
-    /** @param {string} location - CFI of the new location */
-    relocated(location) {
-      if (this.savedEbookLocation === location.start.cfi) {
-        return
-      }
-
-      if (location.end.percentage) {
-        this.updateProgress({
-          ebookLocation: location.start.cfi,
-          ebookProgress: location.end.percentage
-        })
-      } else {
-        this.updateProgress({
-          ebookLocation: location.start.cfi
-        })
-      }
-    },
-    initEpub() {
-      /** @type {EpubReader} */
-      const reader = this
-
-      // Use axios to make request because we have token refresh logic in interceptor
-      const customRequest = async (url) => {
-        try {
-          return this.$axios.$get(url, {
-            responseType: 'arraybuffer'
+        const text = doc.body?.textContent || ''
+        const haystack = text.toLowerCase()
+        const items = []
+        for (
+          let at = haystack.indexOf(needle);
+          at !== -1 && items.length < MAX_SEARCH_RESULTS_PER_SECTION;
+          at = haystack.indexOf(needle, at + needle.length)
+        ) {
+          const range = this.rangeOfOffsets(doc, at, at + needle.length)
+          items.push({
+            cfi: this.view.getCFI(index, range),
+            excerpt: text.slice(Math.max(0, at - 40), at + needle.length + 60).trim()
           })
-        } catch (error) {
-          console.error('EpubReader.initEpub customRequest failed:', error)
-          throw error
         }
+        if (!items.length) continue
+
+        // Sections outside the TOC go to the first chapter.
+        const target = byHref.get(this.normaliseHref(section.id)) || chapters[0]
+        if (target) target.searchResults = items
       }
 
-      /** @type {ePub.Book} */
-      reader.book = new ePub(reader.ebookUrl, {
-        width: this.readerWidth,
-        height: this.readerHeight - 50,
-        openAs: 'epub',
-        requestMethod: customRequest
-      })
-
-      /** @type {ePub.Rendition} */
-      reader.rendition = reader.book.renderTo('viewer', {
-        width: this.readerWidth,
-        height: this.readerHeight * 0.8,
-        allowScriptedContent: this.allowScriptedContent,
-        spread: 'auto',
-        snap: true,
-        manager: 'continuous',
-        flow: 'paginated'
-      })
-
-      // load saved progress
-      reader.rendition.display(this.savedEbookLocation || reader.book.locations.start)
-
-      reader.rendition.on('rendered', () => {
-        this.applyTheme()
-      })
-
-      reader.book.ready
-        .then(() => {
-          // set up event listeners
-          reader.rendition.on('relocated', reader.relocated)
-          reader.rendition.on('keydown', reader.keyUp)
-
-          reader.rendition.on('touchstart', (event) => {
-            this.$emit('touchstart', event)
-          })
-          reader.rendition.on('touchend', (event) => {
-            this.$emit('touchend', event)
-          })
-
-          // load ebook cfi locations
-          const savedLocations = this.loadLocations()
-          if (savedLocations) {
-            reader.book.locations.load(savedLocations)
-          } else {
-            reader.book.locations.generate().then(() => {
-              this.checkSaveLocations(reader.book.locations.save())
-            })
-          }
-          this.getChapters()
-        })
-        .catch((error) => {
-          console.error('EpubReader.initEpub failed:', error)
-        })
+      return chapters.filter((c) => c.searchResults.length || c.subitems.some((s) => s.searchResults.length))
     },
-    getChapters() {
-      // Load the list of chapters in the book. See https://github.com/futurepress/epub.js/issues/759
-      const toc = this.book?.navigation?.toc || []
 
-      const tocTree = []
-
-      const resolveURL = (url, relativeTo) => {
-        // see https://github.com/futurepress/epub.js/issues/1084
-        // HACK-ish: abuse the URL API a little to resolve the path
-        // the base needs to be a valid URL, or it will throw a TypeError,
-        // so we just set a random base URI and remove it later
-        const base = 'https://example.invalid/'
-        return new URL(url, base + relativeTo).href.replace(base, '')
-      }
-
-      const basePath = this.book.packaging.navPath || this.book.packaging.ncxPath
-
-      const createTree = async (toc, parent) => {
-        const promises = toc.map(async (tocItem, i) => {
-          const href = resolveURL(tocItem.href, basePath)
-          const id = href.split('#')[1]
-          const item = this.book.spine.get(href)
-          await item.load(this.book.load.bind(this.book))
-          const el = id ? item.document.getElementById(id) : item.document.body
-
-          const cfi = item.cfiFromElement(el)
-
-          parent[i] = {
-            title: tocItem.label.trim(),
-            subitems: [],
-            href,
-            cfi,
-            start: this.book.locations.percentageFromCfi(cfi),
-            end: null, // set by flattenChapters()
-            id: null, // set by flattenChapters()
-            searchResults: []
-          }
-
-          if (tocItem.subitems) {
-            await createTree(tocItem.subitems, parent[i].subitems)
-          }
-        })
-        await Promise.all(promises)
-      }
-      return createTree(toc, tocTree).then(() => {
-        this.chapters = tocTree
-      })
-    },
-    flattenChapters(chapters) {
-      // Convert the nested epub chapters into something that looks like audiobook chapters for player-ui
-      const unwrap = (chapters) => {
-        return chapters.reduce((acc, chapter) => {
-          return chapter.subitems ? [...acc, chapter, ...unwrap(chapter.subitems)] : [...acc, chapter]
-        }, [])
-      }
-      let flattenedChapters = unwrap(chapters)
-
-      flattenedChapters = flattenedChapters.sort((a, b) => a.start - b.start)
-      for (let i = 0; i < flattenedChapters.length; i++) {
-        flattenedChapters[i].id = i
-        if (i < flattenedChapters.length - 1) {
-          flattenedChapters[i].end = flattenedChapters[i + 1].start
-        } else {
-          flattenedChapters[i].end = 1
+    rangeOfOffsets(doc, start, end) {
+      const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT)
+      const range = doc.createRange()
+      let seen = 0
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const length = node.data.length
+        if (start >= seen && start < seen + length) range.setStart(node, start - seen)
+        if (end >= seen && end <= seen + length) {
+          range.setEnd(node, end - seen)
+          break
         }
+        seen += length
       }
-      return flattenedChapters
+      return range
     },
+
+    /** Strip fragment, `./`, and a leading `something.epub/` so sidecar paths match foliate's section ids. */
+    normaliseHref(href) {
+      let path = String(href || '').split('#')[0]
+      try {
+        path = decodeURIComponent(path)
+      } catch {
+        // malformed escape: use the raw path
+      }
+      path = path.replace(/^\.\//, '')
+      const segments = path.split('/')
+      if (segments.length > 1 && /\.epub$/i.test(segments[0])) path = segments.slice(1).join('/')
+      return path.replace(/^\/+/, '')
+    },
+
+    updateProgress(payload) {
+      if (!this.keepProgress) return
+      this.$axios.$patch(`/api/me/progress/${this.libraryItemId}`, payload, { progress: false }).catch((error) => {
+        console.error('[EpubReader] updateProgress failed', error)
+      })
+    },
+
+    /** Debounced. The player opening or closing resizes the reader without a window resize event. */
     resize() {
       this.windowWidth = window.innerWidth
-      this.windowHeight = window.innerHeight
-      this.rendition?.resize(this.readerWidth, this.readerHeight * 0.8)
+      window.clearTimeout(this.resizeTimer)
+      this.resizeTimer = window.setTimeout(() => {
+        this.resizeTimer = null
+        this.restyle()
+      }, 250)
     },
-    applyTheme() {
-      if (!this.rendition) return
-      this.rendition.getContents().forEach((c) => {
-        c.addStylesheetRules(this.themeRules)
-      })
+
+    async loadSyncTrack() {
+      if (!this.smilFile) return
+      try {
+        const text = await this.$axios.$get(`/api/items/${this.libraryItemId}/file/${this.smilFile.ino}/download`, {
+          responseType: 'text',
+          transformResponse: [(data) => data]
+        })
+        // The component may have been closed while the sidecar downloaded.
+        if (this.gone) return
+        const { cues } = this.anchors.parseSmil(text)
+        if (!cues.length) {
+          this.syncStatus = 'Sync file is empty'
+          return
+        }
+        // Cue times are positions in one audio file, which only equal playback positions when the book is one file.
+        const audioFiles = this.libraryItem?.media?.audioFiles?.length || 0
+        if (audioFiles > 1) {
+          this.syncStatus = `Sync file covers one audio file, this book has ${audioFiles}`
+          return
+        }
+        this.syncCues = cues
+        this.syncIndex = this.anchors.buildCueIndex(cues)
+        this.blockCues = this.anchors.indexCuesByBlock(cues, this.normaliseHref)
+        this.applySyncPreference()
+      } catch (error) {
+        console.error('[EpubReader] could not load sync file', error)
+        this.syncStatus = 'Sync file could not be read'
+      }
+    },
+
+    attachSync() {
+      this.detachSync()
+      this.syncTimer = window.setInterval(this.pollPlaybackClock, SYNC_POLL_MS)
+    },
+
+    detachSync() {
+      window.clearInterval(this.syncTimer)
+      this.syncTimer = null
+    },
+
+    playerContainer() {
+      return this.$root?.$refs?.mediaPlayerContainer || null
+    },
+
+    playbackElement() {
+      return document.getElementById('audio-player')
+    },
+
+    /**
+     * Position within the whole audiobook, or null. The <audio> element is only a fallback: tracks
+     * reuse it, so its `currentTime` restarts on every track while the sidecar spans the book.
+     */
+    playbackPosition() {
+      const container = this.playerContainer()
+      if (container && Number.isFinite(container.currentTime) && container.currentTime > 0) {
+        return container.currentTime
+      }
+      const el = this.playbackElement()
+      if (el && el.readyState > 0 && el.currentTime > 0) return el.currentTime
+      return null
+    },
+
+    playbackIsRunning() {
+      if (this.playerContainer()?.playerIsPlaying) return true
+      const el = this.playbackElement()
+      return !!el && !el.paused && !el.ended
+    },
+
+    pollPlaybackClock() {
+      if (!this.syncEnabled) return
+      const time = this.playbackPosition()
+      this.syncBlocker = !this.syncIndex
+        ? 'no sync file'
+        : !this.isPlayingThisItem
+          ? 'not playing this book'
+          : !this.playbackIsRunning()
+            ? 'paused'
+            : time === null
+              ? 'no playback position'
+              : ''
+      if (!this.syncBlocker) this.onPlayerTime(time)
+    },
+
+    onPlayerTime(time) {
+      if (!this.syncEnabled || !this.syncIndex) return
+      if (!Number.isFinite(time) || time < 0) return
+
+      // A big jump is a seek; it must bypass the turn rate limit, which would crawl towards the target.
+      const previous = this.lastSyncTime
+      this.lastSyncTime = time
+      const jumped = previous >= 0 && Math.abs(time - previous) > SEEK_JUMP_SECONDS
+
+      const cue = this.syncIndex.at(time)
+      if (!cue) {
+        if (this.syncPaintedCue !== -1) {
+          this.clearHighlight()
+          this.syncPaintedCue = -1
+          this.syncPaintedWord = -1
+        }
+        return
+      }
+      const word = this.anchors.wordAt(this.prepareCue(cue), time)
+
+      // Compared with what is painted, not requested: a deferred page turn would look finished.
+      if (cue.index === this.syncPaintedCue && word === this.syncPaintedWord) return
+
+      this.syncCueIndex = cue.index
+      this.syncWordIndex = word
+      // The only caller allowed to turn the page.
+      this.refreshSyncHighlight(true, jumped)
+    },
+
+    /** A click on a word moves the narration there; selecting text or following a link does not. */
+    onContentClick(event, doc) {
+      if (this.ereaderSettings.clickToSeek === false || event.button !== 0) return
+      if (event.target?.closest?.('a[href]')) return
+      if (doc.getSelection()?.toString().trim()) return
+      this.seekToPoint(doc, event.clientX, event.clientY)
+    },
+
+    seekToPoint(doc, x, y) {
+      // Only an existing player session can be moved; nothing is started from here.
+      if (!this.syncIndex || !this.blockCues || !this.isPlayingThisItem) return
+      const hit = this.anchors.wordAtPoint(doc, x, y)
+      const entry = hit && this.renderedContents().find((c) => c.doc === doc)
+      if (!entry) return
+      const href = this.normaliseHref(this.book?.sections?.[entry.index]?.id)
+      const time = this.anchors.seekTimeForWord(this.blockCues.get(`${href}#${hit.block.anchor}`), hit.index)
+      // A word the aligner skipped has no time to go to.
+      if (time === null) return
+
+      // Through the event bus: `$root.$refs` does not reach the player container.
+      this.$eventBus.$emit('seek-playback', time)
+      // The poll does not run while paused, so repaint the highlight here.
+      this.onPlayerTime(time)
+    },
+
+    /** Only possible while the cue's section is the one rendered. */
+    prepareCue(cue) {
+      if (cue.wordOffsets) return cue
+      const entry = this.currentSection()
+      if (!entry || this.normaliseHref(entry.href) !== this.normaliseHref(cue.href)) return cue
+      const block = this.anchors.findSyncBlock(entry.doc, cue.anchor)
+      if (block) this.anchors.attachCueText(cue, block.element)
+      return cue
+    },
+
+    renderedContents() {
+      return this.view?.renderer?.getContents?.() || []
+    },
+
+    currentSection() {
+      const entry = this.renderedContents().find((c) => c.doc)
+      if (!entry) return null
+      return {
+        index: entry.index,
+        doc: entry.doc,
+        overlayer: entry.overlayer || null,
+        href: this.book?.sections?.[entry.index]?.id || ''
+      }
+    },
+
+    /**
+     * Single-flight, since the poll does not await and a revealRange that finds `syncNavigating`
+     * set by another run gives up. `allowTurn` is for audio-driven calls; `urgent` skips the
+     * section-turn rate limit.
+     */
+    async refreshSyncHighlight(allowTurn, urgent = false) {
+      if (this.syncTurning) return
+      this.syncTurning = true
+      try {
+        await this.applyHighlight(allowTurn, urgent)
+      } finally {
+        this.syncTurning = false
+      }
+    },
+
+    async applyHighlight(allowTurn, urgent) {
+      const cue = this.syncEnabled ? this.syncCues?.[this.syncCueIndex] : null
+      if (!cue) {
+        this.clearHighlight()
+        return
+      }
+
+      let entry = this.currentSection()
+      if (!entry) return
+
+      if (this.normaliseHref(entry.href) !== this.normaliseHref(cue.href)) {
+        // Also runs on every section load, where turning would override the reader's navigation.
+        if (!allowTurn) {
+          this.clearHighlight()
+          return
+        }
+        const now = Date.now()
+        if (!urgent && now - this.syncLastJump < SECTION_TURN_GAP_MS) return
+        this.syncLastJump = now
+        this.clearHighlight()
+        try {
+          await this.view.goTo(cue.href)
+        } catch (error) {
+          console.warn('[EpubReader] could not turn to', cue.href, error)
+          return
+        }
+        entry = this.currentSection()
+        if (!entry) return
+      }
+
+      const block = this.anchors.findSyncBlock(entry.doc, cue.anchor)
+      if (!block) {
+        // The sidecar and the book disagree about the text.
+        this.syncStatus = `No anchor ${cue.anchor} in ${cue.href}`
+        return
+      }
+      this.syncStatus = ''
+      this.anchors.attachCueText(cue, block.element)
+      this.clearHighlight()
+
+      const { overlayer } = entry
+      const words = cue.wordOffsets
+      const first = words?.[0]
+      const last = words?.[words.length - 1]
+
+      let sentenceRange = null
+      if (first && last && last.end > first.start) {
+        sentenceRange = this.anchors.rangeForOffsets(block.element, first.start, last.end)
+        overlayer?.add(SENTENCE_KEY, sentenceRange, drawHighlight, { color: SENTENCE_COLOR, opacity: SENTENCE_OPACITY })
+      }
+
+      const offsets = words?.[this.syncWordIndex]
+      if (offsets && offsets.end > offsets.start) {
+        const range = this.anchors.rangeForOffsets(block.element, offsets.start, offsets.end)
+        if (range) overlayer?.add(WORD_KEY, range, drawUnderline, { color: WORD_COLOR, width: WORD_RULE_WIDTH })
+      }
+
+      // A section spans many pages, so paginate to the sentence.
+      if (sentenceRange && allowTurn && !(await this.revealRange(entry, sentenceRange))) {
+        // Not on the page yet. Leave the painted cue untouched so the next poll retries.
+        return
+      }
+      this.syncPaintedCue = cue.index
+      this.syncPaintedWord = this.syncWordIndex
+    },
+
+    /**
+     * Asks foliate rather than measuring: the iframe holds the whole section in columns, so
+     * everything is "visible" against its own width. `lastLocation.range` is the real page.
+     */
+    rangeOnScreen(range) {
+      const visible = this.view?.lastLocation?.range
+      if (!range || !visible) return false
+      try {
+        // Ranges overlap when each starts before the other ends.
+        return (
+          visible.compareBoundaryPoints(Range.END_TO_START, range) < 0 &&
+          range.compareBoundaryPoints(Range.END_TO_START, visible) < 0
+        )
+      } catch {
+        return false // ranges from different documents
+      }
+    },
+
+    /**
+     * Paginate to a range if it is not visible. Resolves true once it is on screen; false means
+     * unknown, retry. Guarded against re-entry, since the renderer dispatches `load` while moving.
+     */
+    async revealRange(entry, range) {
+      if (this.syncNavigating) return false
+      if (this.rangeOnScreen(range)) return true
+
+      this.syncNavigating = true
+      try {
+        await this.view.renderer.goTo({ index: entry.index, anchor: range })
+        // goTo is a no-op mid-transition and lastLocation only updates once it settles, so wait.
+        for (let attempt = 0; attempt < 8; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50))
+          if (this.rangeOnScreen(range)) return true
+        }
+        return false
+      } catch (error) {
+        console.warn('[EpubReader] could not reveal range', error)
+        return false
+      } finally {
+        this.syncNavigating = false
+      }
+    },
+
+    clearHighlight() {
+      for (const { overlayer } of this.renderedContents()) {
+        overlayer?.remove(SENTENCE_KEY)
+        overlayer?.remove(WORD_KEY)
+      }
+    },
+
+    /** Overlayer caches rects, so recompute them after a re-flow. */
+    redrawHighlight() {
+      for (const { overlayer } of this.renderedContents()) {
+        try {
+          overlayer?.redraw()
+        } catch {
+          // overlay is mid-teardown; the next load repaints it
+        }
+      }
     }
   },
   mounted() {
-    this.windowWidth = window.innerWidth
-    this.windowHeight = window.innerHeight
     window.addEventListener('resize', this.resize)
     this.initEpub()
   },
   beforeDestroy() {
+    this.gone = true
     window.removeEventListener('resize', this.resize)
-    this.book?.destroy()
+    window.clearTimeout(this.resizeTimer)
+    this.destroy()
   }
 }
 </script>

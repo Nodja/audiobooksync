@@ -552,6 +552,8 @@ export default {
     this.$eventBus.$on('play-queue-item', this.playQueueItem)
     this.$eventBus.$on('play-item', this.playLibraryItem)
     this.$eventBus.$on('pause-item', this.pauseItem)
+    this.$eventBus.$on('close-player', this.closePlayer)
+    this.$eventBus.$on('seek-playback', this.seek)
   },
   beforeDestroy() {
     this.$eventBus.$off('cast-session-active', this.castSessionActive)
@@ -560,6 +562,8 @@ export default {
     this.$eventBus.$off('play-queue-item', this.playQueueItem)
     this.$eventBus.$off('play-item', this.playLibraryItem)
     this.$eventBus.$off('pause-item', this.pauseItem)
+    this.$eventBus.$off('close-player', this.closePlayer)
+    this.$eventBus.$off('seek-playback', this.seek)
   }
 }
 </script>
