@@ -1,1 +1,31 @@
 audiobookshelf-data/
+.scratch/
+
+# Android SDK / Gradle cache and built APKs (3 GB)
+build-tools/
+
+# The alignment graph is fetched from the Hugging Face Hub and cached outside the checkout, so
+# nothing ONNX-shaped should ever land here. Ignore it anyway, in case a graph is ever copied in.
+*.onnx
+*.onnx.data
+*.onnx_data
+
+# Build logs from the two client builds
+*.log
+
+# Local virtualenvs
+.venv*/
+
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Built clients (APK and web zip)
+clients/
+
+# The client forks live on the client-web and client-mobile branches; check them out here with
+#   git worktree add audiobookshelf client-web
+#   git worktree add audiobookshelf-app client-mobile
+/audiobookshelf/
+/audiobookshelf-app/
