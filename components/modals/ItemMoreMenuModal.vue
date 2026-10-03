@@ -9,6 +9,7 @@
 <script>
 import { Dialog } from '@capacitor/dialog'
 import { AbsFileSystem } from '@/plugins/capacitor'
+import { sidecarCache } from '@/plugins/sidecarCache'
 
 export default {
   props: {
@@ -438,6 +439,7 @@ export default {
       if (value) {
         const res = await AbsFileSystem.deleteItem(this.localLibraryItem)
         if (res?.success) {
+          sidecarCache.remove(this.localLibraryItem.libraryItemId)
           if (this.isLocal) {
             // If local then redirect to server version when available
             if (this.serverLibraryItemId) {

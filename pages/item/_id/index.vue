@@ -172,6 +172,7 @@
 <script>
 import { Dialog } from '@capacitor/dialog'
 import { AbsFileSystem, AbsDownloader } from '@/plugins/capacitor'
+import { sidecarCache } from '@/plugins/sidecarCache'
 import { getAverageColorFromCoverUrl } from '@/utils/coverAverageColor'
 import cellularPermissionHelpers from '@/mixins/cellularPermissionHelpers'
 
@@ -690,6 +691,22 @@ export default {
         var errorMsg = downloadRes.error || 'Unknown error'
         console.error('Download error', errorMsg)
         this.$toast.error(errorMsg)
+      } else {
+        this.cacheSidecar()
+      }
+    },
+    /** Keeps the sync sidecar for offline reading; the download itself only brings the ebook and audio. */
+    async cacheSidecar() {
+      const smil = this.libraryFiles.find((lf) => /\.smil$/i.test(lf?.metadata?.filename || ''))
+      if (!smil) return
+      try {
+        await sidecarCache.resolve({
+          key: this.libraryItemId,
+          remote: { ino: smil.ino, size: smil.metadata?.size ?? 0, mtimeMs: smil.metadata?.mtimeMs ?? 0 },
+          fetchText: () => this.$nativeHttp.get(`/api/items/${this.libraryItemId}/file/${smil.ino}/download`)
+        })
+      } catch (error) {
+        console.warn('Could not cache the sync file', error)
       }
     },
     newLocalLibraryItem(item) {

@@ -118,6 +118,12 @@
               </div>
               <ui-toggle-btns v-model="ereaderSettings.keepScreenAwake" name="keep-awake" :items="onOffToggleButtonItems" @input="settingsUpdated" />
             </div>
+            <div v-if="isEpub" class="flex items-center mb-6">
+              <div class="w-32">
+                <p class="text-sm">{{ $strings.LabelClickToSeek }}</p>
+              </div>
+              <ui-toggle-btns v-model="ereaderSettings.clickToSeek" name="click-to-seek" :items="onOffToggleButtonItems" @input="settingsUpdated" />
+            </div>
           </div>
         </div>
       </div>
@@ -130,6 +136,9 @@ import { Capacitor } from '@capacitor/core'
 import { VolumeButtons } from '@capacitor-community/volume-buttons'
 import { KeepAwake } from '@capacitor-community/keep-awake'
 
+/** How long a tap waits for a second one; EpubReader.vue treats two taps this close as a double-tap. */
+const DOUBLE_TAP_MS = 350
+
 export default {
   data() {
     return {
@@ -140,6 +149,7 @@ export default {
       touchstartTime: 0,
       touchIdentifier: null,
       showingToolbar: false,
+      touchOnPlayer: false,
       showTOCModal: false,
       showSettingsModal: false,
       comicHasMetadata: false,
@@ -154,8 +164,12 @@ export default {
         textStroke: 0,
         navigateWithVolume: 'enabled',
         navigateWithVolumeWhilePlaying: false,
-        keepScreenAwake: false
-      }
+        keepScreenAwake: false,
+        clickToSeek: true
+      },
+      // A tap's toolbar toggle waits out the double-tap window, so a double-tap (skip to word) is not also a toggle.
+      pendingToolbarToggle: null,
+      toolbarTapCancelled: false
     }
   },
   watch: {
@@ -392,6 +406,10 @@ export default {
       }
     },
     handleGesture() {
+      if (this.touchOnPlayer) {
+        return
+      }
+
       // Touch must be less than 1s. Must be > 60px drag and X distance > Y distance
       const touchTimeMs = Date.now() - this.touchstartTime
       if (touchTimeMs >= 1000) {
@@ -405,7 +423,7 @@ export default {
         if (this.showSettingsModal) {
           this.showSettingsModal = false
         } else {
-          this.toggleToolbar()
+          this.tapToggleToolbar()
         }
         return
       }
@@ -425,7 +443,8 @@ export default {
     },
     showToolbar() {
       this.showingToolbar = true
-      this.$showHideStatusBar(true)
+      // Showing the status bar insets the WebView, and an epub re-paginates when its container resizes.
+      if (!this.isEpub) this.$showHideStatusBar(true)
     },
     hideToolbar() {
       this.showingToolbar = false
@@ -435,7 +454,30 @@ export default {
       if (this.showingToolbar) this.hideToolbar()
       else this.showToolbar()
     },
+    tapToggleToolbar() {
+      // The second tap of a double-tap: the first one's toggle was cancelled, and this one does nothing.
+      if (this.toolbarTapCancelled) {
+        this.toolbarTapCancelled = false
+        return
+      }
+      if (!this.isEpub || this.ereaderSettings.clickToSeek === false) {
+        this.toggleToolbar()
+        return
+      }
+      this.pendingToolbarToggle = setTimeout(() => {
+        this.pendingToolbarToggle = null
+        this.toggleToolbar()
+      }, DOUBLE_TAP_MS)
+    },
     touchstart(e) {
+      if (this.pendingToolbarToggle) {
+        clearTimeout(this.pendingToolbarToggle)
+        this.pendingToolbarToggle = null
+        this.toolbarTapCancelled = true
+      } else {
+        this.toolbarTapCancelled = false
+      }
+
       // Ignore rapid touch
       if (this.touchstartTime && Date.now() - this.touchstartTime < 250) {
         return
@@ -445,6 +487,8 @@ export default {
       this.touchstartY = e.touches[0].screenY
       this.touchstartTime = Date.now()
       this.touchIdentifier = e.touches[0].identifier
+      // Only the player's own bar takes pointer events, so a touch inside it is the player's.
+      this.touchOnPlayer = !!e.target?.closest?.('#streamContainer')
     },
     touchend(e) {
       if (this.touchIdentifier !== e.changedTouches[0].identifier) {
@@ -543,6 +587,7 @@ export default {
     }
   },
   beforeDestroy() {
+    clearTimeout(this.pendingToolbarToggle)
     this.unregisterListeners()
   }
 }

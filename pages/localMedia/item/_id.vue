@@ -133,6 +133,7 @@ import draggable from 'vuedraggable'
 import { Capacitor } from '@capacitor/core'
 import { Dialog } from '@capacitor/dialog'
 import { AbsFileSystem } from '@/plugins/capacitor'
+import { sidecarCache } from '@/plugins/sidecarCache'
 
 export default {
   components: {
@@ -418,6 +419,7 @@ export default {
       if (value) {
         var res = await AbsFileSystem.deleteItem(this.localLibraryItem)
         if (res && res.success) {
+          sidecarCache.remove(this.localLibraryItem.libraryItemId)
           this.$toast.success('Deleted Successfully')
           this.$router.replace(this.isIos ? '/downloads' : `/localMedia/folders/${this.folderId}`)
         } else this.$toast.error('Failed to delete')
