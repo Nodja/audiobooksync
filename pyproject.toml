@@ -1,7 +1,23 @@
 [project]
 name = "audiobooksync"
-version = "0.1.0"
+dynamic = ["version"]
 requires-python = ">=3.12"
 dependencies = [
-    "onnxruntime-gpu>=1.30.0",
+    "numpy>=2.0",
+    "transformers==4.57.6",
+    "huggingface-hub[hf_xet]>=0.34",
+    "onnxruntime-gpu>=1.22",
 ]
+
+[project.scripts]
+abs-sync = "audiobooksync.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["audiobooksync"]
+
+[tool.setuptools.dynamic]
+version = {attr = "audiobooksync.__version__"}
