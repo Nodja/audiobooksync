@@ -35,7 +35,7 @@ Speed depends on your GPU. The biggest book I have (62 hours) took 20 minutes on
 2. Install a modified client:
    - **Android:** download the APK from the releases and sideload it. It installs alongside the official client so you can have both installed at the same time. It's a debug build so you might get some scary prompts when installing.
    - **iOS:** you're out of luck. I don't own a Mac to build and test the client, so you'll have to build it yourself and hope it works.
-   - **Web:** download the zip from the releases and replace the `client/dist` folder of your install. I use docker, and my docker-compose looks like this:
+   - **Web:** download the zip from the releases, extract it and replace the `client/dist` folder of your install. I use docker, and my docker-compose looks like this:
 
      ```yaml
      services:
